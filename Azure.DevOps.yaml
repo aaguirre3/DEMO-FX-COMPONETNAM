@@ -1,0 +1,283 @@
+jobs:
+- job: Prebuild
+  displayName: 'Prebuild'
+  steps:
+  - checkout: re-tooling-scripts
+  - checkout: self
+  # Validating branch name and setting build number
+  - ${{ if or( contains(variables['Build.SourceBranch'], 'release/'), contains(variables['Build.SourceBranch'], 'hotfix/')) }}:
+    - task: Bash@3
+      name: validate
+      displayName: Validate Branch and Build Number
+      inputs:
+        targetType: 'inline'
+        script: |
+          BRANCH="$(Build.SourceBranch)"
+          fullrepo="$(Build.Repository.Name)"
+          prefix="Green-Dot-Corporation/";
+          REPO=${fullrepo#$prefix}
+          echo "[DEBUG] branch=$BRANCH"
+
+          echo [DEBUG] cd $REPO
+          cd $REPO
+          #git fetch origin 'refs/tags/*:refs/tags/*' -q
+
+          if [[ $BRANCH == refs/heads/release/* ]]; then
+            milestone=`echo $BRANCH | awk -F 'release/' '{print $2}'`
+            echo "[DEBUG] milestone=$milestone"
+            if [[ ! ($milestone =~ ^[0-9]+$ || $milestone =~ ^[0-9]+\.[0-9]*$) ]]; then
+              echo "===========ERROR============" >&2
+              echo "Branch name is not valid. $milestone must be a integer matching the milestone #." >&2
+              echo "Optionally, branch can look like with 'release/X.Y'" >&2
+              echo "Branch: $BRANCH" >&2
+              echo "============================" >&2
+              exit 1
+            fi
+
+            tag=`git tag -l --sort='version:refname' $milestone.0-rc* | tail -1`
+            echo "[DEBUG] tag=$tag"
+            [[ -z "$tag" ]] && rc=0 || rc=${tag#$milestone.0-rc}
+            echo "[DEBUG] rc=$rc"
+
+            release_number="$milestone.0-rc$((rc+1))"
+          else
+            hotfix=`echo $BRANCH | awk -F 'hotfix/' '{print $2}' | awk -F '-' '{print $1}'`
+            echo "[DEBUG] hotfix=$hotfix"
+            if [[ ! $hotfix =~ ^[0-9]+\.[0-9]*$ && ! $hotfix =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "===========ERROR============" >&2
+              echo "Branch name is not valid. Branch must start with hotfix/X.Y, or hotfix/X.Y.Z. e.g. hotfix/140.1, hotfix/140.0.1 " >&2
+              echo "Branch: $BRANCH" >&2
+              echo "============================" >&2
+              exit 1
+            fi
+
+            tag=`git tag -l --sort='version:refname' $hotfix-hf* | tail -1`
+            echo "[DEBUG] tag=$tag"
+            [[ -z "$tag" ]] && hf=0 || hf=${tag#$hotfix-hf}
+            echo "[DEBUG] hf=$hf"
+
+            release_number="$hotfix-hf$((hf+1))"
+          fi
+
+          echo "[DEBUG] release_number=$release_number"
+          echo "##vso[build.updatebuildnumber]$release_number"
+          echo "##vso[task.setvariable variable=rc_tag;isOutput=true]$release_number"
+
+  #Setting variables to be used in future steps
+  - task: Bash@3
+    name: setvarStep
+    displayName: 'Set Variables'
+    inputs:
+      targetType: 'inline'
+      script: |
+        fullrepo="$(Build.Repository.Name)"
+        prefix="Green-Dot-Corporation/";
+        REPO=${fullrepo#$prefix}
+        IFS='-' read -ra REPO_PARTS <<< "${REPO}"
+
+        echo "##vso[task.setvariable variable=org;isOutput=true]${REPO_PARTS[0]}"
+        echo "##vso[task.setvariable variable=component;isOutput=true]${REPO_PARTS[2]}"
+        echo "##vso[task.setvariable variable=repo;isOutput=true]${REPO}"
+
+        case "$(Build.SourceBranch)" in
+          refs/heads/main) echo "##vso[build.addbuildtag]Main" ;;
+          refs/heads/release/*) echo "##vso[build.addbuildtag]Release" ;;
+          refs/heads/hotfix/*) echo "##vso[build.addbuildtag]Hotfix" ;;
+          refs/pull/*/merge) echo "##vso[build.addbuildtag]PR" ;;
+        esac
+  
+  #Checking Jira keys on PR builds
+  - ${{ if and( eq(variables['Build.Reason'], 'PullRequest'), not(contains(variables['Build.SourceBranch'], 'release/')), not(contains(variables['Build.SourceBranch'], 'hotfix/')) ) }}:
+    - task: PowerShell@2
+      name: prTitleChecker
+      displayName: 'Check Pull Request Title'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $Headers = @{
+            "Authorization" = "Bearer $(GITHUB-PAT)"
+            "Accept"        = "application/vnd.github+json"
+          }
+          $GithubUri = "https://api.github.com/repos/Green-Dot-Corporation/$(setvarStep.repo)/pulls/$(System.PullRequest.PullRequestNumber)"
+          $issue = Invoke-RestMethod -Uri $GithubUri -Headers $Headers
+          $PullRequestTitle = $issue.title
+
+          ./re-tooling-scripts/jira/PreCheckCommitMessage.ps1 `
+            -PullRequestTitle $PullRequestTitle `
+            -JiraUserName $(ARTIFACTORY-USER) `
+            -JiraPassword $(ARTIFACTORY-PASS) `
+            -GithubRepo $(setvarStep.repo) 
+
+  #Auto approving PRs if all commits are from the same previous PR (promoting changes from main into release/hotfix)
+  - ${{ if and( eq(variables['Build.Reason'], 'PullRequest'), not(contains(variables['Build.TargetBranch'], 'main')) ) }}:
+    - task: Bash@3
+      name: installGhCli
+      displayName: 'Install gh cli'
+      inputs:
+        targetType: 'inline'
+        script: |
+          type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt update \
+          && sudo apt install gh -y
+
+          gh auth login --with-token <<< $(GITHUB-PAT)
+    - task: Bash@3
+      name: prAutoApprove
+      displayName: 'Auto Approve PR if all commits are from the same previous PR'
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          ORG="Green-Dot-Corporation"
+          REPO="$(setvarStep.repo)"
+          PULL="$(System.PullRequest.PullRequestNumber)"
+
+          declare -A hashmap
+          autoapprove=false
+          pr=""
+
+          # For each commit(limit 100) on the PR, get recent PRs they are associated with
+          # If and only if associated PR was merged, api only returns that one
+          gh api graphql -f query="query {repository(name: \"$REPO\", owner: \"$ORG\") {pullRequest(number: $PULL) {id commits(last: 100) { edges {node {commit {associatedPullRequests(last: 5) {edges {node {number}}}}}}}}}}" > pr.json
+          
+          # Insert into hashmap to calculate # of unique PRs
+          while read object; do
+              if [[ $object == null ]]; then
+                  echo "Found unmerged commit(s) in PR $PULL. Cancelling autoapprove"
+                  exit 0
+              fi
+            hashmap["$object"]="$object"
+            pr="$object"
+            echo "Commit from PR ${hashmap[$object]}"
+          done <<< "$(cat pr.json | jq .data.repository.pullRequest.commits.edges[].node.commit.associatedPullRequests.edges[0].node.number)"
+
+          echo "Found commits in ${#hashmap[@]} PRs"
+          # If hashmap has only one entry, all commits under PR came from the same PR
+          # And check if that PR is not itself
+          [[ ${#hashmap[@]} == 1 && "${hashmap[$pr]}" != "$PULL" ]] && autoapprove=true || autoapprove=false
+
+          # Auto approve
+          if [[ $autoapprove == true ]]; then
+              echo "Auto approving PR $PULL"
+              id=`cat pr.json | jq .data.repository.pullRequest.id | tr -d '"'`
+              gh api graphql -f query="mutation {addPullRequestReview(input: {pullRequestId: \"$id\", body: \"Approved in PR $pr. Identical commits\", event: APPROVE }) {pullRequestReview {id body}clientMutationId}}"
+          fi
+
+  #Cheking if main and release/* branches are sync
+  - ${{ if ( contains(variables['Build.SourceBranch'], 'release/')) }}:
+    - task: Bash@3
+      name: checkSync
+      displayName: 'Check sync between main and release'
+      continueOnError: true
+      inputs:
+        targetType: 'inline'
+        script: |
+          BASE_BRANCH="$(system.pullRequest.sourceBranch)"
+          fullrepo="$(Build.Repository.Name)"
+          prefix="Green-Dot-Corporation/";
+          REPO=${fullrepo#$prefix}
+          echo "[DEBUG] branch=$BASE_BRANCH"
+
+          echo [DEBUG] cd $REPO
+          cd $REPO
+          
+          gh auth login --with-token <<< $(GITHUB-PAT)
+          # GitHub CLI api
+          # https://cli.github.com/manual/gh_api
+          
+          diff_files=$(gh pr diff BASE_BRANCH)
+          if [[ -z "$diff_files" ]]; then
+            echo "$BASE_BRANCH and main are sync."
+          else
+            echo "¡Error! $BASE_BRANCH and $COMPARE_BRANCH are out of sync:"
+            echo "$diff_files"
+            exit 1
+          fi
+
+  #Checking Jira keys on PR builds
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+    - task: Bash@3
+      name: getJiraIssueKey
+      displayName: 'Get Jira issue from git commit message'
+      inputs:
+        targetType: 'inline'
+        script: |
+          pushd $WORK_DIR
+          echo "Working Dir: $PWD"
+          CommitMessage=`git log --format=%B -n 1 $GIT_COMMIT_HASH | head -n 5`
+
+          echo "--- Printing out commit message ----"
+          echo "$CommitMessage"
+          echo "------------------------------------"
+
+          # Regular expression that matches a Jira Ticket ID
+          JIRA_ISSUE_KEY_REGEX="(^[A-Z]{2,10}-)([0-9]{1,18})"
+
+          ### Extract Jira Issue Key(s) ###
+          if [[ $CommitMessage =~ $JIRA_ISSUE_KEY_REGEX ]]; then
+            echo "First match"
+            JiraIssueKey=${BASH_REMATCH[0]}
+            echo "JiraIssueKey: $JiraIssueKey"
+          else
+            echo "##vso[task.logissue type=error] Jira issue key not found in git commit message."
+            exit 1
+          fi
+
+          echo "##vso[task.setvariable variable=jira_issue_key;isOutput=true]$JiraIssueKey"
+      env:
+        GIT_COMMIT_HASH: $(Build.SourceVersion)
+        WORK_DIR: "$(setvarStep.repo)/"
+
+  #Publishing build link to Jira
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+    - task: Bash@3
+      name: publishBuildLinkToJira
+      displayName: 'Publish ADO Build link to Jira issue'
+      inputs:
+        targetType: 'inline'
+        script: |
+          adoOrg=`echo $SYSTEM_TEAMFOUNDATIONCOLLECTIONURI | awk -F'/' '{print $4}'`
+          adoProjectName=${SYSTEM_TEAMPROJECT// /%20}
+
+          tee -a remote-link-payload.json << END
+          {
+            "globalId": "system=https://dev.azure.com/${adoOrg}/${adoProjectName}/_build/results?buildId=${BUILD_ID}&view=results",
+            "application": {
+              "type":"com.azure.dev",
+              "name":"Azure DevOps"
+            },
+            "relationship":"referred in CI Build",
+            "object": {
+              "url":"https://dev.azure.com/${adoOrg}/${adoProjectName}/_build/results?buildId=${BUILD_ID}&view=results",     
+              "title":"[${COMPONENT_NAME}] - Build ${BUILD_NUMBER}",
+              "summary":"Azure DevOps CI Build for ${COMPONENT_NAME}",
+              "icon": {
+                "url16x16":"https://cdn.vsassets.io/ext/ms.vss-build-web/common-library/Nav-Launch.3tiJhd.png",    
+                "title":"Azure DevOps CI Build"    
+              }
+            }
+          }
+          END
+
+          echo calling Jira url "${JIRA_SERVER_URL}/rest/api/latest/issue/${JiraIssueKey}/remotelink"
+          cred=`echo -n ${ARTIFACTORY_USER}:${ARTIFACTORY_PASS} | base64`
+          curl \
+          -ks \
+          -X POST \
+          -H "Authorization: Basic ${cred}" \
+          -H "Content-Type: application/json" \
+          -d @remote-link-payload.json \
+          "${JIRA_SERVER_URL}/rest/api/latest/issue/${JiraIssueKey}/remotelink"
+      env:
+        JiraIssueKey: $(getJiraIssueKey.jira_issue_key)
+        # component is from setvarStep task step in this job template
+        COMPONENT_NAME: $(setvarStep.component)
+        JIRA_SERVER_URL: $(JIRA-SERVER-URL)
+        ARTIFACTORY_USER: $(ARTIFACTORY-USER)
+        ARTIFACTORY_PASS: $(ARTIFACTORY-PASS)
+        # Build.BuildId and Build.BuildNumber are from ADO pipeline predefined vars
+        BUILD_ID: $(Build.BuildId)
+        BUILD_NUMBER: $(Build.BuildNumber)
